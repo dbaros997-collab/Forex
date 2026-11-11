@@ -1,0 +1,25 @@
+# Coolify / Nixpacks build for the Streamlit dashboard.
+# The Python provider installs Python, creates /opt/venv, and installs
+# requirements.txt. paths puts that environment on PATH for the start command.
+# Entry point: app.py
+
+providers = ["python"]
+
+[variables]
+NIXPACKS_PYTHON_VERSION = "3.12"
+PORT = "8501"
+
+[phases.setup]
+nixPkgs = ["...", "python312"]
+
+[phases.install]
+dependsOn = ["...", "setup"]
+cmds = [
+  "python -m venv /opt/venv",
+  "/opt/venv/bin/pip install --upgrade pip",
+  "/opt/venv/bin/pip install -r requirements.txt",
+]
+paths = ["...", "/opt/venv/bin"]
+
+[start]
+cmd = "streamlit run app.py --server.port=8501 --server.address=0.0.0.0"
