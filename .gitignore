@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+.streamlit/secrets.toml
 
 # Python bytecode
 __pycache__/

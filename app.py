@@ -7,6 +7,8 @@ Run: streamlit run app.py
 
 from __future__ import annotations
 
+import hmac
+import os
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -271,8 +273,75 @@ def _render_header_metric(column: Any, label: str, value: str) -> None:
     )
 
 
+def _expected_credentials() -> tuple[str, str] | None:
+    """Read the login from the environment or Streamlit secrets. Never hardcode it."""
+    username = os.environ.get("APP_USERNAME", "").strip()
+    password = os.environ.get("APP_PASSWORD", "")
+    try:
+        if not username and "APP_USERNAME" in st.secrets:
+            username = str(st.secrets["APP_USERNAME"]).strip()
+        if not password and "APP_PASSWORD" in st.secrets:
+            password = str(st.secrets["APP_PASSWORD"])
+    except Exception:
+        pass
+    if not username or not password:
+        return None
+    return username, password
+
+
+def _credentials_match(username: str, password: str) -> bool:
+    expected = _expected_credentials()
+    if expected is None:
+        return False
+    expected_username, expected_password = expected
+    return hmac.compare_digest(
+        username.strip().encode("utf-8"),
+        expected_username.encode("utf-8"),
+    ) and hmac.compare_digest(
+        password.encode("utf-8"),
+        expected_password.encode("utf-8"),
+    )
+
+
+def _render_login_gate() -> None:
+    _, center, _ = st.columns([1, 1.15, 1])
+    with center:
+        st.title("Sign in")
+        st.caption("Enter your username and password to open the Forex dashboard.")
+        if _expected_credentials() is None:
+            st.warning(
+                "Login is not configured on this server. "
+                "Set APP_USERNAME and APP_PASSWORD before signing in."
+            )
+        with st.form("login_form", clear_on_submit=False):
+            username = st.text_input("Username", autocomplete="username")
+            password = st.text_input(
+                "Password",
+                type="password",
+                autocomplete="current-password",
+            )
+            submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
+        if submitted:
+            if _expected_credentials() is None:
+                st.error("Login is not configured on this server.")
+            elif _credentials_match(username, password):
+                st.session_state.authenticated = True
+                st.session_state.auth_username = username.strip()
+                st.rerun()
+            else:
+                st.error("Incorrect username or password.")
+
+
+def _logout() -> None:
+    st.session_state.authenticated = False
+    st.session_state.auth_username = ""
+    st.rerun()
+
+
 def _init_app_session_state() -> None:
     defaults = {
+        "authenticated": False,
+        "auth_username": "",
         "mt5_connected": False,
         "mt5_account_id": None,
         "mt5_status_message": "",
@@ -334,13 +403,20 @@ def main() -> None:
         layout="wide",
     )
 
+    _init_app_session_state()
+    if not st.session_state.authenticated:
+        _render_login_gate()
+        return
+
     st.title("Forex Supply & Demand Scanner")
     st.caption("Cloud-ready supply & demand analysis with remote webhook execution.")
 
-    _init_app_session_state()
     _render_platform_banner()
 
     with st.sidebar:
+        st.caption(f"Signed in as **{st.session_state.auth_username}**")
+        if st.button("Log out", use_container_width=True):
+            _logout()
         st.header("Settings")
         pair_label = st.selectbox(
             "Currency pair",
