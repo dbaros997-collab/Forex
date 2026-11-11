@@ -7,16 +7,19 @@ Run: streamlit run app.py
 
 from __future__ import annotations
 
-import hmac
 import os
+import secrets
 import sys
 from datetime import timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit_authenticator as stauth
+from streamlit_authenticator.utilities import Hasher, LoginError
 
 # Ensure project modules resolve from this folder (not a stale/cached `signals` elsewhere).
 _APP_DIR = Path(__file__).resolve().parent
@@ -273,75 +276,126 @@ def _render_header_metric(column: Any, label: str, value: str) -> None:
     )
 
 
+# Used only when APP_COOKIE_KEY is unset. Stable for this process so a browser
+# refresh can restore the signed cookie until the server restarts.
+_PROCESS_COOKIE_KEY = secrets.token_hex(32)
+_COOKIE_NAME = "forex_scanner_auth"
+_COOKIE_EXPIRY_DAYS = 30
+
+
+def _secret_setting(name: str) -> str:
+    value = os.environ.get(name, "")
+    if value:
+        return value
+    try:
+        if name in st.secrets:
+            return str(st.secrets[name])
+    except Exception:
+        return ""
+    return ""
+
+
 def _expected_credentials() -> tuple[str, str] | None:
     """Read the login from the environment or Streamlit secrets. Never hardcode it."""
-    username = os.environ.get("APP_USERNAME", "").strip()
-    password = os.environ.get("APP_PASSWORD", "")
-    try:
-        if not username and "APP_USERNAME" in st.secrets:
-            username = str(st.secrets["APP_USERNAME"]).strip()
-        if not password and "APP_PASSWORD" in st.secrets:
-            password = str(st.secrets["APP_PASSWORD"])
-    except Exception:
-        pass
+    username = _secret_setting("APP_USERNAME").strip()
+    password = _secret_setting("APP_PASSWORD")
     if not username or not password:
         return None
     return username, password
 
 
-def _credentials_match(username: str, password: str) -> bool:
-    expected = _expected_credentials()
-    if expected is None:
-        return False
-    expected_username, expected_password = expected
-    return hmac.compare_digest(
-        username.strip().encode("utf-8"),
-        expected_username.encode("utf-8"),
-    ) and hmac.compare_digest(
-        password.encode("utf-8"),
-        expected_password.encode("utf-8"),
+def _cookie_key() -> str:
+    configured = _secret_setting("APP_COOKIE_KEY").strip()
+    return configured or _PROCESS_COOKIE_KEY
+
+
+@lru_cache(maxsize=4)
+def _password_hash(password: str) -> str:
+    return Hasher.hash(password)
+
+
+def _build_authenticator() -> stauth.Authenticate | None:
+    credentials = _expected_credentials()
+    if credentials is None:
+        return None
+    username, password = credentials
+    return stauth.Authenticate(
+        {
+            "usernames": {
+                username: {
+                    "email": f"{username}@localhost",
+                    "first_name": username,
+                    "last_name": "",
+                    "password": _password_hash(password),
+                }
+            }
+        },
+        _COOKIE_NAME,
+        _cookie_key(),
+        _COOKIE_EXPIRY_DAYS,
+        auto_hash=False,
+        login_sleep_time=0,
     )
 
 
-def _render_login_gate() -> None:
+def _render_login_gate(authenticator: stauth.Authenticate) -> bool:
+    """Restore a signed cookie or show the sign-in form. True when authenticated."""
+    try:
+        authenticator.login(location="unrendered", key="login_restore")
+    except LoginError as exc:
+        st.error(str(exc))
+        return False
+
+    if st.session_state.get("authentication_status"):
+        return True
+
+    _, center, _ = st.columns([1, 1.15, 1])
+    with center:
+        st.caption("Enter your username and password to open the Forex dashboard.")
+        try:
+            authenticator.login(
+                location="main",
+                fields={
+                    "Form name": "Sign in",
+                    "Username": "Username",
+                    "Password": "Password",
+                    "Login": "Sign in",
+                },
+                clear_on_submit=False,
+                key="login_form",
+            )
+        except LoginError as exc:
+            st.error(str(exc))
+        if st.session_state.get("authentication_status") is False:
+            st.error("Incorrect username or password.")
+    return bool(st.session_state.get("authentication_status"))
+
+
+def _render_logout(authenticator: stauth.Authenticate) -> None:
+    signed_in_as = st.session_state.get("username") or st.session_state.get("name") or ""
+    st.caption(f"Signed in as **{signed_in_as}**")
+    authenticator.logout(
+        button_name="Log out",
+        location="sidebar",
+        key="logout_button",
+        use_container_width=True,
+    )
+    if not st.session_state.get("authentication_status"):
+        st.rerun()
+
+
+def _render_unconfigured_login() -> None:
     _, center, _ = st.columns([1, 1.15, 1])
     with center:
         st.title("Sign in")
-        st.caption("Enter your username and password to open the Forex dashboard.")
-        if _expected_credentials() is None:
-            st.warning(
-                "Login is not configured on this server. "
-                "Set APP_USERNAME and APP_PASSWORD before signing in."
-            )
-        with st.form("login_form", clear_on_submit=False):
-            username = st.text_input("Username", autocomplete="username")
-            password = st.text_input(
-                "Password",
-                type="password",
-                autocomplete="current-password",
-            )
-            submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
-        if submitted:
-            if _expected_credentials() is None:
-                st.error("Login is not configured on this server.")
-            elif _credentials_match(username, password):
-                st.session_state.authenticated = True
-                st.session_state.auth_username = username.strip()
-                st.rerun()
-            else:
-                st.error("Incorrect username or password.")
-
-
-def _logout() -> None:
-    st.session_state.authenticated = False
-    st.session_state.auth_username = ""
-    st.rerun()
+        st.warning(
+            "Login is not configured on this server. "
+            "Set APP_USERNAME and APP_PASSWORD before signing in."
+        )
 
 
 def _init_app_session_state() -> None:
     defaults = {
-        "authenticated": False,
-        "auth_username": "",
         "mt5_connected": False,
         "mt5_account_id": None,
         "mt5_status_message": "",
@@ -404,8 +458,11 @@ def main() -> None:
     )
 
     _init_app_session_state()
-    if not st.session_state.authenticated:
-        _render_login_gate()
+    authenticator = _build_authenticator()
+    if authenticator is None:
+        _render_unconfigured_login()
+        return
+    if not _render_login_gate(authenticator):
         return
 
     st.title("Forex Supply & Demand Scanner")
@@ -414,9 +471,7 @@ def main() -> None:
     _render_platform_banner()
 
     with st.sidebar:
-        st.caption(f"Signed in as **{st.session_state.auth_username}**")
-        if st.button("Log out", use_container_width=True):
-            _logout()
+        _render_logout(authenticator)
         st.header("Settings")
         pair_label = st.selectbox(
             "Currency pair",
