@@ -281,6 +281,9 @@ def _render_header_metric(column: Any, label: str, value: str) -> None:
 _PROCESS_COOKIE_KEY = secrets.token_hex(32)
 _COOKIE_NAME = "forex_scanner_auth"
 _COOKIE_EXPIRY_DAYS = 30
+# Used only when APP_USERNAME / APP_PASSWORD are unset in the environment and secrets.
+_DEFAULT_APP_USERNAME = "admin"
+_DEFAULT_APP_PASSWORD = "changeme"
 
 
 def _secret_setting(name: str) -> str:
@@ -295,12 +298,16 @@ def _secret_setting(name: str) -> str:
     return ""
 
 
-def _expected_credentials() -> tuple[str, str] | None:
-    """Read the login from the environment or Streamlit secrets. Never hardcode it."""
-    username = _secret_setting("APP_USERNAME").strip()
+def _expected_credentials() -> tuple[str, str]:
+    """Read the login from the environment or Streamlit secrets.
+
+    Empty or missing values fall back to local defaults so the dashboard can
+    still be opened when those settings are not configured.
+    """
+    username = _secret_setting("APP_USERNAME").strip() or _DEFAULT_APP_USERNAME
     password = _secret_setting("APP_PASSWORD")
-    if not username or not password:
-        return None
+    if not password.strip():
+        password = _DEFAULT_APP_PASSWORD
     return username, password
 
 
@@ -314,11 +321,8 @@ def _password_hash(password: str) -> str:
     return Hasher.hash(password)
 
 
-def _build_authenticator() -> stauth.Authenticate | None:
-    credentials = _expected_credentials()
-    if credentials is None:
-        return None
-    username, password = credentials
+def _build_authenticator() -> stauth.Authenticate:
+    username, password = _expected_credentials()
     return stauth.Authenticate(
         {
             "usernames": {
@@ -382,16 +386,6 @@ def _render_logout(authenticator: stauth.Authenticate) -> None:
     )
     if not st.session_state.get("authentication_status"):
         st.rerun()
-
-
-def _render_unconfigured_login() -> None:
-    _, center, _ = st.columns([1, 1.15, 1])
-    with center:
-        st.title("Sign in")
-        st.warning(
-            "Login is not configured on this server. "
-            "Set APP_USERNAME and APP_PASSWORD before signing in."
-        )
 
 
 def _init_app_session_state() -> None:
@@ -459,9 +453,6 @@ def main() -> None:
 
     _init_app_session_state()
     authenticator = _build_authenticator()
-    if authenticator is None:
-        _render_unconfigured_login()
-        return
     if not _render_login_gate(authenticator):
         return
 
