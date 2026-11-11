@@ -39,9 +39,11 @@ from webhook_bridge import (
 if MT5_AVAILABLE:
     from mt5_connect import (
         get_mt5_account_info,
+        latest_quote,
         login_mt5,
         place_zone_order,
         shutdown_mt5,
+        trading_readiness,
         yahoo_symbol_to_mt5,
     )
 else:
@@ -64,6 +66,12 @@ else:
         return False, "MetaTrader5 is not available on this host."
 
     def shutdown_mt5() -> None:
+        return None
+
+    def trading_readiness() -> tuple[bool, str]:
+        return False, "MetaTrader5 is not available on this host."
+
+    def latest_quote(_symbol: str) -> None:
         return None
 
 PAIR_OPTIONS = {
@@ -102,6 +110,8 @@ SUPPLY_LINE = "rgba(242, 54, 69, 0.65)"
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_market_data(symbol: str, interval: str, period: str) -> pd.DataFrame:
+    # Cached history for charts and zone detection. This is not the MT5 live
+    # tick stream; orders use latest_quote from the terminal instead.
     return fetch_forex_data(symbol, period=period, interval=interval)
 
 
@@ -413,6 +423,14 @@ def _render_platform_banner() -> None:
             "Runtime: **cloud / mobile SaaS mode** — charts, zones, risk sizing, and "
             "**webhook execution** are fully available. Native MT5 is disabled on this host."
         )
+    st.caption(str(caps.get("data_feed") or ""))
+    mt5_configured = any(
+        caps.get(key)
+        for key in ("mt5_native", "mt5_account_configured", "mt5_server_configured", "mt5_password_configured")
+    )
+    if mt5_configured:
+        for error in caps.get("mt5_config_errors") or []:
+            st.warning(str(error))
 
 
 def _broker_symbol(symbol: str) -> str:
@@ -492,10 +510,31 @@ def main() -> None:
         if MT5_AVAILABLE:
             st.divider()
             st.subheader("Local MT5 (Windows PC)")
-            st.caption("Local MT5 execution (Windows terminal)")
-            mt5_account = st.text_input("Account number", value="", placeholder="12345678")
-            mt5_password = st.text_input("Password", type="password")
-            mt5_server = st.text_input("Server", value="ICMarkets-Demo", placeholder="Broker-Server")
+            st.caption(
+                "Account, password, and server can be set here or with "
+                "MT5_ACCOUNT, MT5_PASSWORD, and MT5_SERVER. "
+                "A blank password uses the environment or Streamlit secrets and is not stored."
+            )
+            # Prefill from env/secrets. The password box stays empty so the secret
+            # is not copied into the widget.
+            mt5_account = st.text_input(
+                "Account number",
+                value=_secret_setting("MT5_ACCOUNT").strip(),
+                placeholder="12345678",
+            )
+            mt5_password = st.text_input(
+                "Password",
+                type="password",
+                help="Leave blank to use MT5_PASSWORD. The value is not written to session state.",
+            )
+            mt5_server = st.text_input(
+                "Server",
+                value=_secret_setting("MT5_SERVER").strip(),
+                placeholder="Broker-Server",
+            )
+            terminal_path = _secret_setting("MT5_TERMINAL_PATH").strip()
+            if terminal_path:
+                st.caption(f"Terminal: {terminal_path}")
 
             connect_col, disconnect_col = st.columns(2)
             with connect_col:
@@ -504,19 +543,21 @@ def main() -> None:
                 disconnect_mt5 = st.button("Disconnect", use_container_width=True)
 
             if connect_mt5:
-                if not mt5_account or not mt5_password or not mt5_server:
-                    st.session_state.mt5_connected = False
-                    st.session_state.mt5_status_message = "Enter account, password, and server."
-                else:
-                    success, message = login_mt5(mt5_account, mt5_password, mt5_server)
-                    st.session_state.mt5_connected = success
-                    st.session_state.mt5_status_message = message
-                    if success:
-                        info = get_mt5_account_info()
-                        if info:
-                            st.session_state.mt5_account_id = info["login"]
-                            st.session_state.mt5_balance = info["balance"]
-                            st.session_state.account_balance = info["balance"]
+                # Sidebar values override environment. An empty password falls
+                # back to MT5_PASSWORD from the environment or Streamlit secrets.
+                password = mt5_password if str(mt5_password).strip() else _secret_setting("MT5_PASSWORD")
+                try:
+                    success, message = login_mt5(mt5_account, password, mt5_server)
+                except Exception:
+                    success, message = False, "MT5 login failed because of an unexpected error."
+                st.session_state.mt5_connected = success
+                st.session_state.mt5_status_message = message
+                if success:
+                    info = get_mt5_account_info()
+                    if info:
+                        st.session_state.mt5_account_id = info["login"]
+                        st.session_state.mt5_balance = info["balance"]
+                        st.session_state.account_balance = info["balance"]
 
             if disconnect_mt5:
                 shutdown_mt5()
@@ -547,6 +588,17 @@ def main() -> None:
                         """,
                         unsafe_allow_html=True,
                     )
+                    ready, ready_msg = trading_readiness()
+                    if ready:
+                        st.caption(ready_msg)
+                    else:
+                        st.warning(ready_msg)
+                    quote = latest_quote(symbol)
+                    if quote:
+                        st.caption(
+                            f"Live {quote['symbol']} bid {quote['bid']} / ask {quote['ask']}. "
+                            "This terminal quote is what a market order uses."
+                        )
                 else:
                     st.warning("MT5 session lost. Please connect again.")
                     st.session_state.mt5_connected = False
@@ -717,17 +769,23 @@ def main() -> None:
                     st.error(hook_msg)
 
             if MT5_AVAILABLE and send_mt5:
+                # Explicit button only. place_zone_order rechecks that algo
+                # trading is enabled and that stops sit on the correct side of
+                # the live bid/ask, which can differ from the cached chart.
                 if not st.session_state.mt5_connected:
                     st.warning("Connect MT5 in the sidebar before local execution.")
                 else:
                     with st.spinner("Sending order to MT5…"):
-                        ok, exec_msg = place_zone_order(
-                            symbol=symbol,
-                            order_type=order_type,
-                            lot_size=float(trade["lot_size"]),
-                            stop_loss=float(trade["stop_loss_price"]),
-                            take_profit=take_profit,
-                        )
+                        try:
+                            ok, exec_msg = place_zone_order(
+                                symbol=symbol,
+                                order_type=order_type,
+                                lot_size=float(trade["lot_size"]),
+                                stop_loss=float(trade["stop_loss_price"]),
+                                take_profit=take_profit,
+                            )
+                        except Exception:
+                            ok, exec_msg = False, "MT5 order failed because of an unexpected error."
                     if ok:
                         st.success(exec_msg)
                     else:

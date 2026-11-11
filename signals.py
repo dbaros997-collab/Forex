@@ -15,11 +15,16 @@ from indicators import SupplyDemandZone
 # Optional native MT5 — never required for cloud / mobile SaaS hosts.
 MT5_AVAILABLE = False
 _MT5_IMPORT_ERROR: str | None = None
+_MT5_ENV: dict[str, Any] = {}
 
 try:
-    from mt5_connect import MT5_AVAILABLE as _MT5_FLAG
+    from mt5_connect import (
+        MT5_AVAILABLE as _MT5_FLAG,
+        connection_settings_from_env,
+    )
 
     MT5_AVAILABLE = bool(_MT5_FLAG)
+    _MT5_ENV = connection_settings_from_env()
 except ImportError as exc:
     _MT5_IMPORT_ERROR = str(exc)
 except Exception as exc:  # pragma: no cover - defensive for broken native installs
@@ -27,7 +32,12 @@ except Exception as exc:  # pragma: no cover - defensive for broken native insta
 
 
 def get_platform_capabilities() -> dict[str, Any]:
-    """Report what execution features are available on this runtime."""
+    """Report what execution features are available on this runtime.
+
+    MT5 flags describe the local terminal only. Chart candles are cached market
+    history, not the terminal's live bid/ask. A market order uses that live
+    quote after a successful login, and only when the user sends it.
+    """
     return {
         "chart_analysis": True,
         "zone_detection": True,
@@ -37,9 +47,17 @@ def get_platform_capabilities() -> dict[str, Any]:
         "mt5_note": (
             "MetaTrader5 terminal not available on this host."
             if not MT5_AVAILABLE
-            else "Local MT5 execution available."
+            else "Local MT5 execution available. Orders are sent only from the Execute button."
         ),
         "mt5_import_error": _MT5_IMPORT_ERROR,
+        "mt5_account_configured": bool(_MT5_ENV.get("account")),
+        "mt5_server_configured": bool(_MT5_ENV.get("server")),
+        "mt5_password_configured": bool(_MT5_ENV.get("password_configured")),
+        "mt5_config_errors": list(_MT5_ENV.get("config_errors") or []),
+        "data_feed": (
+            "Chart candles are cached market history, not a live MT5 tick stream. "
+            "Execute on MT5 prices the order from the terminal's current bid or ask."
+        ),
     }
 
 
